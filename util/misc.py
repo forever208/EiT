@@ -252,11 +252,9 @@ def add_weight_decay(model, weight_decay=0, skip_list=()):
         {'params': decay, 'weight_decay': weight_decay}]
 
 
-def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
-    if epoch_name is None:
-        epoch_name = str(epoch)
+def save_model(args, model_without_ddp, optimizer, epoch):
     output_dir = Path(args.output_dir)
-    checkpoint_path = output_dir / ('checkpoint-%s.pth' % epoch_name)
+    checkpoint_path = output_dir / ('checkpoint-%s.pth' % epoch)
 
     to_save = {
         'model': model_without_ddp.state_dict(),

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from model_jit import JiT_models
+import torch.nn.functional as F
+from model_eit import EiT_models
 
 
 class Denoiser(nn.Module):
@@ -9,12 +10,19 @@ class Denoiser(nn.Module):
         args
     ):
         super().__init__()
-        self.net = JiT_models[args.model](
+        self.repa_weight = getattr(args, "repa_weight", 0.0)
+        self.use_repa = self.repa_weight > 0 and not getattr(args, "evaluate_gen", False)
+        self.net = EiT_models[args.model](
             input_size=args.img_size,
             in_channels=3,
             num_classes=args.class_num,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
+            u_type=getattr(args, "u_type", "432"),
+            use_long_skip=getattr(args, 'use_long_skip', False),
+            compile_scope=getattr(args, 'compile_scope', 'model'),
+            repa_depth=getattr(args, "repa_depth", None),
+            use_repa=self.use_repa,
         )
         self.img_size = args.img_size
         self.num_classes = args.class_num
@@ -46,7 +54,26 @@ class Denoiser(nn.Module):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
 
-    def forward(self, x, labels):
+    # def sample_t(self, n: int, device=None, reject_range=(0.94, 1.0)):
+    #     lo, hi = reject_range
+    #     assert 0.0 <= lo < hi <= 1.0, "reject_range should be inside [0, 1]"
+    #     assert not (lo <= 0.0 and hi >= 1.0), "Cannot reject the whole valid sigmoid range"
+    #
+    #     z = torch.randn(n, device=device) * self.P_std + self.P_mean
+    #     t = torch.sigmoid(z)
+    #
+    #     mask = (t >= lo) & (t <= hi)
+    #     while mask.any():
+    #         num_reject = mask.sum().item()
+    #         z_new = torch.randn(num_reject, device=device) * self.P_std + self.P_mean
+    #         t_new = torch.sigmoid(z_new)
+    #         t[mask] = t_new
+    #         mask = (t >= lo) & (t <= hi)
+    #
+    #     perm = torch.randperm(n, device=device)
+    #     return t[perm]
+
+    def forward(self, x, labels, repa_target=None):
         labels_dropped = self.drop_labels(labels) if self.training else labels
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
@@ -55,14 +82,28 @@ class Denoiser(nn.Module):
         z = t * x + (1 - t) * e
         v = (x - z) / (1 - t).clamp_min(self.t_eps)
 
-        x_pred = self.net(z, t.flatten(), labels_dropped)
+        if self.use_repa:
+            if repa_target is None:
+                raise ValueError("REPA is enabled but no repa_target was given")
+            x_pred, repa_pred = self.net(z, t.flatten(), labels_dropped, return_repa=True)
+        else:
+            x_pred = self.net(z, t.flatten(), labels_dropped)
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
         # l2 loss
-        loss = (v - v_pred) ** 2
-        loss = loss.mean(dim=(1, 2, 3)).mean()
+        loss_pixel = (v - v_pred) ** 2
+        loss_pixel = loss_pixel.mean(dim=(1, 2, 3)).mean()
 
-        return loss
+        # repa loss: negative cosine similarity per token
+        if self.use_repa:
+            cos_sim = (F.normalize(repa_target, dim=-1) * F.normalize(repa_pred, dim=-1)).sum(dim=-1)
+            loss_repa = (1 - cos_sim).mean()
+            loss = loss_pixel + self.repa_weight * loss_repa
+        else:
+            loss_repa = torch.zeros((), device=x.device)
+            loss = loss_pixel
+
+        return loss, loss_pixel.detach(), loss_repa.detach()
 
     @torch.no_grad()
     def generate(self, labels):
@@ -89,13 +130,22 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def _forward_sample(self, z, t, labels):
+        denominator = (1.0 - t).clamp_min(self.t_eps)
+
+        if self.cfg_scale == 0:
+            x_uncond = self.net(z, t.flatten(), torch.full_like(labels, self.num_classes))
+            return (x_uncond - z) / denominator
+
         # conditional
         x_cond = self.net(z, t.flatten(), labels)
-        v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
+        v_cond = (x_cond - z) / denominator
+
+        if self.cfg_scale == 1:
+            return v_cond
 
         # unconditional
         x_uncond = self.net(z, t.flatten(), torch.full_like(labels, self.num_classes))
-        v_uncond = (x_uncond - z) / (1.0 - t).clamp_min(self.t_eps)
+        v_uncond = (x_uncond - z) / denominator
 
         # cfg interval
         low, high = self.cfg_interval

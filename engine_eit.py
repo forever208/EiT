@@ -13,17 +13,19 @@ import torch_fidelity
 import copy
 
 
-def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
+def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None, repa_encoder=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
+    metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    header = "Epoch: [{}]".format(epoch)
     print_freq = 20
 
     optimizer.zero_grad()
 
     if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
+        print("log_dir: {}".format(log_writer.log_dir))
+
+    torch.distributed.barrier()
 
     for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # per iteration (instead of per epoch) lr scheduler
@@ -31,11 +33,13 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         # normalize image to [-1, 1]
         x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
+        # REPA targets are computed in fp32 from images in [0, 1]
+        repa_target = repa_encoder(x) if repa_encoder is not None else None
         x = x * 2.0 - 1.0
         labels = labels.to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            loss = model(x, labels)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            loss, loss_pixel, loss_repa = model(x, labels, repa_target)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -51,17 +55,27 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         model_without_ddp.update_ema()
 
         metric_logger.update(loss=loss_value)
+        if repa_encoder is not None:
+            loss_pixel_value = loss_pixel.item()
+            loss_repa_value = loss_repa.item()
+            metric_logger.update(loss_pixel=loss_pixel_value, loss_repa=loss_repa_value)
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
+        if repa_encoder is not None:
+            loss_pixel_reduce = misc.all_reduce_mean(loss_pixel_value)
+            loss_repa_reduce = misc.all_reduce_mean(loss_repa_value)
 
         if log_writer is not None:
             # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             if data_iter_step % args.log_freq == 0:
-                log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('lr', lr, epoch_1000x)
+                log_writer.add_scalar("train_loss", loss_value_reduce, epoch_1000x)
+                if repa_encoder is not None:
+                    log_writer.add_scalar("train_loss_pixel", loss_pixel_reduce, epoch_1000x)
+                    log_writer.add_scalar("train_loss_repa", loss_repa_reduce, epoch_1000x)
+                log_writer.add_scalar("lr", lr, epoch_1000x)
 
 
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
@@ -71,27 +85,45 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     local_rank = misc.get_rank()
     num_steps = args.num_images // (batch_size * world_size) + 1
 
-    # Construct the folder name for saving generated images.
+    # Node-local folder: rank 0 computes FID from it, so all ranks must share one node.
     save_folder = os.path.join(
-        "ssd/tmp",
-        args.output_dir,
-        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}".format(
-            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
-            model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size
-        )
+        "/tmp/jit_eval",
+        os.path.abspath(args.output_dir).lstrip(os.sep),
+        "{}-steps{}-cfg{}-ema{}-interval{}-{}-image{}-res{}-epoch{}".format(
+            model_without_ddp.method,
+            model_without_ddp.steps,
+            model_without_ddp.cfg_scale,
+            args.eval_ema,
+            model_without_ddp.cfg_interval[0],
+            model_without_ddp.cfg_interval[1],
+            args.num_images,
+            args.img_size,
+            epoch,
+        ),
     )
     print("Save to:", save_folder)
     if misc.get_rank() == 0 and not os.path.exists(save_folder):
         os.makedirs(save_folder)
 
-    # switch to ema params, hard-coded to be the first one
+    # Switch to the EMA selected for sampling.
+    if math.isclose(args.eval_ema, args.ema_decay1, rel_tol=0.0, abs_tol=1e-12):
+        ema_params = model_without_ddp.ema_params1
+    elif math.isclose(args.eval_ema, args.ema_decay2, rel_tol=0.0, abs_tol=1e-12):
+        ema_params = model_without_ddp.ema_params2
+    else:
+        raise ValueError(
+            f"--eval_ema={args.eval_ema} has no EMA weights; "
+            f"available decays are {args.ema_decay1} and {args.ema_decay2}"
+        )
+    torch.distributed.barrier()
     model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
     ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
     for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
         assert name in ema_state_dict
-        ema_state_dict[name] = model_without_ddp.ema_params1[i]
-    print("Switch to ema")
+        ema_state_dict[name] = ema_params[i]
+    print(f"Switch to EMA {args.eval_ema}")
     model_without_ddp.load_state_dict(ema_state_dict)
+    torch.distributed.barrier()
 
     # ensure that the number of images per class is equal.
     class_num = args.class_num
@@ -107,7 +139,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         labels_gen = class_label_gen_world[start_idx:end_idx]
         labels_gen = torch.Tensor(labels_gen).long().cuda()
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             sampled_images = model_without_ddp.generate(labels_gen)
 
         torch.distributed.barrier()
@@ -123,22 +155,30 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
                 break
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
+            cv2.imwrite(os.path.join(save_folder, "{}.png".format(str(img_id).zfill(5))), gen_img)
 
     torch.distributed.barrier()
 
     # back to no ema
-    print("Switch back from ema")
+    print("Switch model from ema (for eval) to no ema (for training)")
     model_without_ddp.load_state_dict(model_state_dict)
 
     # compute FID and IS
-    if log_writer is not None:
+    fid = float("nan")
+    inception_score = float("nan")
+    if misc.is_main_process():
         if args.img_size == 256:
-            fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
+            fid_statistics_file = "fid_stats/jit_in256_stats.npz"
         elif args.img_size == 512:
-            fid_statistics_file = 'fid_stats/jit_in512_stats.npz'
+            fid_statistics_file = "fid_stats/jit_in512_stats.npz"
         else:
             raise NotImplementedError
+        num_saved = len([f for f in os.listdir(save_folder) if f.endswith(".png")])
+        if num_saved != args.num_images:
+            raise RuntimeError(
+                f"Expected {args.num_images} images in {save_folder}, found {num_saved}; "
+                "node-local eval folder requires all ranks on one node"
+            )
         metrics_dict = torch_fidelity.calculate_metrics(
             input1=save_folder,
             input2=None,
@@ -150,12 +190,21 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
             prc=False,
             verbose=False,
         )
-        fid = metrics_dict['frechet_inception_distance']
-        inception_score = metrics_dict['inception_score_mean']
-        postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
-        log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
-        log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
+        fid = metrics_dict["frechet_inception_distance"]
+        inception_score = metrics_dict["inception_score_mean"]
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+
+    # IMPORTANT: sync BEFORE cleanup and BEFORE broadcast
+    torch.distributed.barrier()
+
+    # broadcast numbers from rank0 so every rank can safely unpack
+    t = torch.tensor([fid, inception_score], device="cuda", dtype=torch.float32)
+    torch.distributed.broadcast(t, src=0)
+    fid, inception_score = float(t[0].item()), float(t[1].item())
+
+    torch.distributed.barrier()
+    if misc.is_main_process():
         shutil.rmtree(save_folder)
 
     torch.distributed.barrier()
+    return fid, inception_score
